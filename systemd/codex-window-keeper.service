@@ -1,0 +1,6 @@
+[Unit]
+Description=Codex window keeper tick
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/codex-window-keeper tick

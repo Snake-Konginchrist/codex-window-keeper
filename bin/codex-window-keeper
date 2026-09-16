@@ -1,0 +1,487 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/codex-window-keeper/config"
+STATE_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/codex-window-keeper"
+LOG_FILE="$STATE_ROOT/keeper.log"
+
+# gtimeout covers macOS with coreutils installed via Homebrew (no bare
+# `timeout` there); empty means neither is on PATH.
+resolve_timeout_bin() {
+  if command -v timeout >/dev/null 2>&1; then
+    printf 'timeout'
+  elif command -v gtimeout >/dev/null 2>&1; then
+    printf 'gtimeout'
+  fi
+}
+TIMEOUT_BIN="$(resolve_timeout_bin)"
+
+# Formats an epoch seconds value as local time on both GNU and BSD date.
+fmt_epoch() {
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    date -r "$1" '+%Y-%m-%d %H:%M:%S'
+  else
+    date -d "@$1" '+%Y-%m-%d %H:%M:%S'
+  fi
+}
+
+log() {
+  mkdir -p "$STATE_ROOT"
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$LOG_FILE"
+}
+
+load_config() {
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "config not found: $CONFIG_FILE (run install.sh first)" >&2
+    exit 1
+  fi
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+  : "${CODEX_BIN:?CODEX_BIN not set in $CONFIG_FILE}"
+  : "${MODEL:?MODEL not set in $CONFIG_FILE}"
+  : "${ACCOUNTS:?ACCOUNTS not set in $CONFIG_FILE}"
+  : "${WINDOW_SECS:?WINDOW_SECS not set in $CONFIG_FILE}"
+  : "${PING_TIMEOUT:?PING_TIMEOUT not set in $CONFIG_FILE}"
+  : "${RPC_TIMEOUT:?RPC_TIMEOUT not set in $CONFIG_FILE}"
+  : "${PROMPT:?PROMPT not set in $CONFIG_FILE}"
+  REASONING_EFFORT="${REASONING_EFFORT:-low}"
+  BACKOFF_SECS="${BACKOFF_SECS:-1800}"
+}
+
+account_state_dir() {
+  printf '%s/%s' "$STATE_ROOT" "$1"
+}
+
+# Prints the account's CODEX_HOME, or empty for the default account.
+account_codex_home() {
+  local label="$1" var
+  if [[ "$label" == "default" ]]; then
+    return 0
+  fi
+  var="CODEX_HOME_$label"
+  if [[ -z "${!var:-}" ]]; then
+    echo "missing CODEX_HOME_$label for account '$label' in $CONFIG_FILE" >&2
+    exit 1
+  fi
+  printf '%s' "${!var}"
+}
+
+numeric_or_null() {
+  if [[ -z "$1" || "$1" == "null" ]]; then
+    printf 'null'
+  else
+    printf '%s' "$1"
+  fi
+}
+
+# Free RPC read of account/rateLimits/read. Prints .result.rateLimits and
+# returns 0 on success, prints nothing and returns 1 on any failure.
+#
+# stdin to `codex app-server` must stay open until the async reply lands, or
+# the process exits at EOF before the id:2 response is ever written. A FIFO
+# held open on our side (fd 9) is what keeps it alive.
+read_limits() {
+  local label="$1" codex_home fifo out_file pid line elapsed err rate_limits
+  codex_home="$(account_codex_home "$label")"
+
+  fifo="$(mktemp -u "${TMPDIR:-/tmp}/cwk-fifo.XXXXXX")"
+  out_file="$(mktemp "${TMPDIR:-/tmp}/cwk-out.XXXXXX")"
+  mkfifo "$fifo"
+
+  local env_args=()
+  if [[ -n "$codex_home" ]]; then
+    env_args=("CODEX_HOME=$codex_home")
+  fi
+
+  "$TIMEOUT_BIN" "$((RPC_TIMEOUT + 10))" env "${env_args[@]+"${env_args[@]}"}" "$CODEX_BIN" app-server \
+    < "$fifo" > "$out_file" 2>/dev/null &
+  pid=$!
+
+  exec 9>"$fifo"
+  printf '%s\n' \
+    '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"cwk","title":"cwk","version":"1.0.0"}}}' \
+    '{"jsonrpc":"2.0","method":"initialized","params":{}}' \
+    '{"jsonrpc":"2.0","id":2,"method":"account/rateLimits/read","params":{"excludeResetCreditDetails":true}}' \
+    >&9
+
+  line=""
+  elapsed=0
+  while [[ "$elapsed" -lt "$RPC_TIMEOUT" ]]; do
+    line="$(grep -m1 '"id":2' "$out_file" 2>/dev/null || true)"
+    if [[ -n "$line" ]]; then
+      break
+    fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+      break
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+
+  exec 9>&-
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  rm -f "$fifo" "$out_file"
+
+  if [[ -z "$line" ]]; then
+    return 1
+  fi
+
+  err="$(printf '%s' "$line" | jq -r '.error // empty' 2>/dev/null || true)"
+  if [[ -n "$err" ]]; then
+    return 1
+  fi
+
+  rate_limits="$(printf '%s' "$line" | jq -c '.result.rateLimits // empty' 2>/dev/null || true)"
+  if [[ -z "$rate_limits" || "$rate_limits" == "null" ]]; then
+    return 1
+  fi
+
+  printf '%s\n' "$rate_limits"
+}
+
+write_state() {
+  local label="$1" resets_at="$2" source="$3" used_pct="$4" weekly_used_pct="$5" \
+    weekly_resets_at="$6" plan_type="$7" last_ping_at="$8" last_result="$9" last_error="${10}"
+  local state_dir state_path tmp
+  state_dir="$(account_state_dir "$label")"
+  mkdir -p "$state_dir"
+  state_path="$state_dir/state.json"
+  tmp="$(mktemp "${state_path}.tmp.XXXXXX")"
+  jq -n \
+    --argjson resets_at "$resets_at" \
+    --arg source "$source" \
+    --argjson used_pct "$(numeric_or_null "$used_pct")" \
+    --argjson weekly_used_pct "$(numeric_or_null "$weekly_used_pct")" \
+    --argjson weekly_resets_at "$(numeric_or_null "$weekly_resets_at")" \
+    --arg plan_type "$plan_type" \
+    --argjson last_ping_at "$last_ping_at" \
+    --arg last_result "$last_result" \
+    --arg last_error "$last_error" \
+    '{resets_at:$resets_at,source:$source,used_pct:$used_pct,weekly_used_pct:$weekly_used_pct,
+      weekly_resets_at:$weekly_resets_at,plan_type:(if $plan_type=="" then null else $plan_type end),
+      last_ping_at:$last_ping_at,last_result:$last_result,last_error:$last_error}' \
+    > "$tmp"
+  mv "$tmp" "$state_path"
+}
+
+resets_in_minutes() {
+  local resets_at="$1" now diff
+  now="$(date +%s)"
+  diff=$(( resets_at - now ))
+  (( diff < 0 )) && diff=0
+  echo $(( diff / 60 ))
+}
+
+resets_in_human() {
+  local resets_at="$1" now diff abs_diff hours mins
+  now="$(date +%s)"
+  diff=$(( resets_at - now ))
+  if (( diff >= 0 )); then
+    abs_diff=$diff
+  else
+    abs_diff=$(( -diff ))
+  fi
+  hours=$(( abs_diff / 3600 ))
+  mins=$(( (abs_diff % 3600) / 60 ))
+  if (( diff >= 0 )); then
+    printf 'in %dh%dm' "$hours" "$mins"
+  else
+    printf '%dh%dm ago' "$hours" "$mins"
+  fi
+}
+
+# Decides ping/skip/backoff for one account without pinging or writing state.
+decide_dry_run() {
+  local label="$1" force="$2" limits resets_at mins now
+  limits="$(read_limits "$label" || true)"
+  if [[ -z "$limits" ]]; then
+    echo "would-backoff $label rate limit read failed"
+    return 0
+  fi
+
+  resets_at="$(printf '%s' "$limits" | jq -r '.primary.resetsAt // empty')"
+  now="$(date +%s)"
+  if [[ "$force" -eq 0 ]] && [[ "$resets_at" =~ ^[0-9]+$ ]] && (( resets_at > now )); then
+    mins="$(resets_in_minutes "$resets_at")"
+    echo "would-skip $label window active, resets in ${mins}m"
+  else
+    echo "would-ping $label"
+  fi
+}
+
+# Atomic mkdir-based lock, portable to macOS bash 3.2. Stores the holder's
+# pid in lock.d/pid so a stale lock from a dead process can be reclaimed.
+acquire_lock() {
+  local label="$1" state_dir lock_dir pid
+  state_dir="$(account_state_dir "$label")"
+  lock_dir="$state_dir/lock.d"
+  mkdir -p "$state_dir"
+
+  if mkdir "$lock_dir" 2>/dev/null; then
+    printf '%s' "$$" > "$lock_dir/pid"
+    return 0
+  fi
+
+  pid="$(cat "$lock_dir/pid" 2>/dev/null || true)"
+  if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
+    rm -rf "$lock_dir"
+    if mkdir "$lock_dir" 2>/dev/null; then
+      printf '%s' "$$" > "$lock_dir/pid"
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+release_lock() {
+  local label="$1"
+  rm -rf "$(account_state_dir "$label")/lock.d"
+}
+
+ping_account() {
+  local label="$1" force="$2" state_dir now limits
+  state_dir="$(account_state_dir "$label")"
+  mkdir -p "$state_dir"
+
+  if ! acquire_lock "$label"; then
+    log "skip $label locked (another run in progress)"
+    return 0
+  fi
+  # Crash safety net: the pid check in acquire_lock recovers a stale lock
+  # even if this trap never fires (e.g. SIGKILL).
+  # shellcheck disable=SC2064 # intentional: bind label's value now, not at trap time
+  trap "release_lock '$label'" EXIT
+
+  now="$(date +%s)"
+  limits="$(read_limits "$label" || true)"
+
+  if [[ -z "$limits" ]]; then
+    write_state "$label" "$((now + BACKOFF_SECS))" backoff null null null "" "$now" rpc-error "rate limit read failed"
+    log "backoff $label rate limit read failed"
+    release_lock "$label"
+    trap - EXIT
+    return 0
+  fi
+
+  local resets_at used_pct weekly_used_pct weekly_resets_at plan_type
+  resets_at="$(printf '%s' "$limits" | jq -r '.primary.resetsAt // empty')"
+  used_pct="$(printf '%s' "$limits" | jq -r '.primary.usedPercent // empty')"
+  weekly_used_pct="$(printf '%s' "$limits" | jq -r '.secondary.usedPercent // empty')"
+  weekly_resets_at="$(printf '%s' "$limits" | jq -r '.secondary.resetsAt // empty')"
+  plan_type="$(printf '%s' "$limits" | jq -r '.planType // empty')"
+
+  if [[ "$force" -eq 0 ]] && [[ "$resets_at" =~ ^[0-9]+$ ]] && (( resets_at > now )); then
+    write_state "$label" "$resets_at" rpc "$used_pct" "$weekly_used_pct" "$weekly_resets_at" "$plan_type" "$now" skip ""
+    local mins
+    mins="$(resets_in_minutes "$resets_at")"
+    log "skip $label window active, resets in ${mins}m"
+    release_lock "$label"
+    trap - EXIT
+    return 0
+  fi
+
+  local codex_home env_args=() ping_out ping_rc
+  codex_home="$(account_codex_home "$label")"
+  if [[ -n "$codex_home" ]]; then
+    env_args=("CODEX_HOME=$codex_home")
+  fi
+
+  set +e
+  ping_out="$("$TIMEOUT_BIN" "$PING_TIMEOUT" env "${env_args[@]+"${env_args[@]}"}" "$CODEX_BIN" exec \
+    --ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check \
+    -s read-only -m "$MODEL" -c "model_reasoning_effort=$REASONING_EFFORT" --json \
+    "$PROMPT" < /dev/null 2>/dev/null)"
+  ping_rc=$?
+  set -e
+
+  if [[ "$ping_rc" -ne 0 ]] || ! printf '%s' "$ping_out" | grep -q '"type":"turn.completed"'; then
+    write_state "$label" "$((now + BACKOFF_SECS))" backoff null null null "" "$now" error "ping failed (rc=$ping_rc)"
+    log "ping $label failed rc=$ping_rc"
+    release_lock "$label"
+    trap - EXIT
+    return 0
+  fi
+
+  local limits2 resets_at2 used_pct2 weekly_used_pct2 weekly_resets_at2 plan_type2
+  limits2="$(read_limits "$label" || true)"
+  if [[ -n "$limits2" ]]; then
+    resets_at2="$(printf '%s' "$limits2" | jq -r '.primary.resetsAt // empty')"
+    if [[ "$resets_at2" =~ ^[0-9]+$ ]] && (( resets_at2 > now )); then
+      used_pct2="$(printf '%s' "$limits2" | jq -r '.primary.usedPercent // empty')"
+      weekly_used_pct2="$(printf '%s' "$limits2" | jq -r '.secondary.usedPercent // empty')"
+      weekly_resets_at2="$(printf '%s' "$limits2" | jq -r '.secondary.resetsAt // empty')"
+      plan_type2="$(printf '%s' "$limits2" | jq -r '.planType // empty')"
+      write_state "$label" "$resets_at2" rpc "$used_pct2" "$weekly_used_pct2" "$weekly_resets_at2" "$plan_type2" "$now" ok ""
+      log "ping $label ok resets_at=$(fmt_epoch "$resets_at2") source=rpc"
+      release_lock "$label"
+      trap - EXIT
+      return 0
+    fi
+  fi
+
+  write_state "$label" "$((now + WINDOW_SECS))" assumed null null null "" "$now" ping-ok-read-failed "post-ping rate limit read failed"
+  log "ping $label ok source=assumed (post-ping read failed)"
+  release_lock "$label"
+  trap - EXIT
+}
+
+# Checks deps. mode "read" (status, dry-run) covers what read_limits needs;
+# "full" (tick/ping) has no extra deps beyond that. mode "basic" (log) needs jq only.
+require_deps() {
+  local mode="$1"
+  local missing=()
+
+  command -v jq >/dev/null 2>&1 || missing+=("jq")
+
+  if [[ "$mode" == "read" || "$mode" == "full" ]]; then
+    command -v mkfifo >/dev/null 2>&1 || missing+=("mkfifo")
+    [[ -n "$TIMEOUT_BIN" ]] || missing+=("timeout or gtimeout")
+    if [[ -z "${CODEX_BIN:-}" ]] || [[ ! -x "$CODEX_BIN" ]]; then
+      missing+=("CODEX_BIN (${CODEX_BIN:-unset})")
+    fi
+  fi
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    local item
+    for item in "${missing[@]}"; do
+      log "error missing dependency: $item"
+      echo "error missing dependency: $item" >&2
+    done
+    exit 1
+  fi
+}
+
+account_list_array() {
+  local labels="$1"
+  IFS=' ' read -ra ACCOUNT_LIST <<< "$labels"
+}
+
+run_tick() {
+  local force="$1" dry_run="$2" account="$3" labels label
+  labels="${account:-$ACCOUNTS}"
+  account_list_array "$labels"
+
+  for label in "${ACCOUNT_LIST[@]+"${ACCOUNT_LIST[@]}"}"; do
+    if [[ "$dry_run" -eq 1 ]]; then
+      decide_dry_run "$label" "$force"
+      continue
+    fi
+    ping_account "$label" "$force"
+  done
+}
+
+run_status() {
+  local account="$1" labels label
+  labels="${account:-$ACCOUNTS}"
+  account_list_array "$labels"
+
+  for label in "${ACCOUNT_LIST[@]+"${ACCOUNT_LIST[@]}"}"; do
+    local state_path limits source
+    state_path="$(account_state_dir "$label")/state.json"
+    limits="$(read_limits "$label" || true)"
+
+    local resets_at used_pct weekly_used_pct plan_type last_ping_at last_result
+    if [[ -n "$limits" ]]; then
+      resets_at="$(printf '%s' "$limits" | jq -r '.primary.resetsAt // empty')"
+      used_pct="$(printf '%s' "$limits" | jq -r '.primary.usedPercent // empty')"
+      weekly_used_pct="$(printf '%s' "$limits" | jq -r '.secondary.usedPercent // empty')"
+      plan_type="$(printf '%s' "$limits" | jq -r '.planType // empty')"
+      source="live"
+      last_ping_at=""
+      last_result=""
+      if [[ -f "$state_path" ]]; then
+        last_ping_at="$(jq -r '.last_ping_at // empty' "$state_path")"
+        last_result="$(jq -r '.last_result // empty' "$state_path")"
+      fi
+    elif [[ -f "$state_path" ]]; then
+      resets_at="$(jq -r '.resets_at // empty' "$state_path")"
+      used_pct="$(jq -r '.used_pct // empty' "$state_path")"
+      weekly_used_pct="$(jq -r '.weekly_used_pct // empty' "$state_path")"
+      plan_type="$(jq -r '.plan_type // empty' "$state_path")"
+      last_ping_at="$(jq -r '.last_ping_at // empty' "$state_path")"
+      last_result="$(jq -r '.last_result // empty' "$state_path")"
+      source="stale"
+    else
+      printf '%-10s %s\n' "$label" "UNKNOWN"
+      continue
+    fi
+
+    local now state resets_local countdown last_ping_local
+    now="$(date +%s)"
+    if [[ -n "$resets_at" ]] && [[ "$resets_at" =~ ^[0-9]+$ ]] && (( resets_at > now )); then
+      state="ACTIVE"
+    else
+      state="LAPSED"
+    fi
+
+    resets_local="-"
+    countdown="-"
+    if [[ -n "$resets_at" && "$resets_at" != "null" ]]; then
+      resets_local="$(fmt_epoch "$resets_at")"
+      countdown="$(resets_in_human "$resets_at")"
+    fi
+
+    last_ping_local="-"
+    if [[ -n "$last_ping_at" && "$last_ping_at" != "null" ]]; then
+      last_ping_local="$(fmt_epoch "$last_ping_at")"
+    fi
+
+    printf '%-10s %-8s resets=%s (%s) used_pct=%s weekly_pct=%s plan=%s source=%s last_ping=%s last_result=%s\n' \
+      "$label" "$state" "$resets_local" "$countdown" "${used_pct:--}" "${weekly_used_pct:--}" \
+      "${plan_type:--}" "$source" "$last_ping_local" "${last_result:--}"
+  done
+}
+
+run_log() {
+  if [[ -f "$LOG_FILE" ]]; then
+    tail -n 50 "$LOG_FILE"
+  else
+    echo "no log yet: $LOG_FILE"
+  fi
+}
+
+main() {
+  local cmd="" force=0 dry_run=0 account=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) force=1; shift ;;
+      --dry-run) dry_run=1; shift ;;
+      --account) account="$2"; shift 2 ;;
+      tick|ping|status|log) cmd="$1"; shift ;;
+      *) echo "unknown argument: $1" >&2; exit 1 ;;
+    esac
+  done
+  [[ -z "$cmd" ]] && cmd="tick"
+
+  case "$cmd" in
+    tick)
+      load_config
+      if [[ "$dry_run" -eq 1 ]]; then
+        require_deps read
+      else
+        require_deps full
+      fi
+      run_tick "$force" "$dry_run" "$account"
+      ;;
+    ping)
+      load_config
+      require_deps full
+      run_tick 1 0 "$account"
+      ;;
+    status)
+      load_config
+      require_deps read
+      run_status "$account"
+      ;;
+    log)
+      require_deps basic
+      run_log
+      ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi

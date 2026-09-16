@@ -1,0 +1,11 @@
+CODEX_BIN=/usr/bin/codex           # install.sh resolves `command -v codex` and writes it (systemd PATH is minimal)
+MODEL=gpt-5.6-luna
+REASONING_EFFORT=low
+ACCOUNTS="default"                 # space-separated labels. "default" = unset CODEX_HOME. Any other label needs CODEX_HOME_<label>, e.g.:
+# ACCOUNTS="default work"
+# CODEX_HOME_work=$HOME/.codex-work
+WINDOW_SECS=18000
+PING_TIMEOUT=180
+RPC_TIMEOUT=30
+BACKOFF_SECS=1800
+PROMPT="Reply with the single word: ok. Do not use any tools."

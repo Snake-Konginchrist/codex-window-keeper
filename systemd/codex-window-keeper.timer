@@ -1,0 +1,10 @@
+[Unit]
+Description=Codex window keeper timer
+
+[Timer]
+OnCalendar=*:0/10
+Persistent=true
+Unit=codex-window-keeper.service
+
+[Install]
+WantedBy=timers.target
